@@ -52,11 +52,11 @@ export class IndexPipeline {
 
       this.store.upsertNode(node);
 
-      // Compute and store embedding
-      const tags = Array.isArray(node.frontmatter.tags) ? node.frontmatter.tags : [];
-      const text = Embedder.buildEmbeddingText(node.title, tags as string[], node.content);
-      const embedding = await this.embedder.embed(text);
-      this.store.upsertEmbedding(node.id, embedding);
+      // Chunk the body into overlapping ~200-token windows and embed each
+      // chunk separately, so long notes are retrievable by their relevant
+      // passage rather than diluted into one whole-note vector.
+      const chunks = await this.embedder.embedChunks(node.content);
+      this.store.upsertEmbeddings(node.id, chunks);
 
       // Re-index edges from this node
       this.store.deleteAllEdgesFrom(node.id);

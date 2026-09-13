@@ -47,8 +47,13 @@ export class Store {
       CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts
         USING fts5(title, content, content='nodes', content_rowid='rowid');
 
-      CREATE VIRTUAL TABLE IF NOT EXISTS nodes_vec
-        USING vec0(embedding float[384]);
+      -- One row per content chunk (not per node): a note's body is split into
+      -- overlapping ~200-token windows, each embedded separately, so a single
+      -- node can have many vectors. node_id/chunk_index/chunk_text are
+      -- auxiliary vec0 columns (stored, not ANN-indexed) used to trace a
+      -- match back to its node and to show the exact matching passage.
+      CREATE VIRTUAL TABLE IF NOT EXISTS node_chunks_vec
+        USING vec0(embedding float[384], +node_id TEXT, +chunk_index INTEGER, +chunk_text TEXT);
     `);
   }
 
@@ -177,9 +182,8 @@ export class Store {
       this.db.prepare(
         "INSERT INTO nodes_fts(nodes_fts, rowid, title, content) VALUES('delete', ?, ?, ?)"
       ).run(row.rowid, row.title, row.content);
-      // sqlite-vec requires BigInt rowids via better-sqlite3
-      this.db.prepare('DELETE FROM nodes_vec WHERE rowid = ?').run(BigInt(row.rowid));
     }
+    this.db.prepare('DELETE FROM node_chunks_vec WHERE node_id = ?').run(id);
 
     this.db.prepare('DELETE FROM nodes WHERE id = ?').run(id);
     this.db.prepare('DELETE FROM edges WHERE source_id = ? OR target_id = ?').run(id, id);
@@ -207,29 +211,67 @@ export class Store {
     }));
   }
 
-  upsertEmbedding(nodeId: string, embedding: Float32Array): void {
-    const node = this.getNode(nodeId);
-    if (!node) return;
-    // sqlite-vec requires BigInt rowids via better-sqlite3
-    this.db.prepare('DELETE FROM nodes_vec WHERE rowid = ?').run(BigInt(node.rowid));
-    this.db.prepare(
-      'INSERT INTO nodes_vec(rowid, embedding) VALUES (?, ?)'
-    ).run(BigInt(node.rowid), Buffer.from(embedding.buffer));
+  /**
+   * Replaces all chunk embeddings for a node. Unlike the old one-vector-per-node
+   * scheme (keyed by nodes.rowid), chunk rows are keyed by the node_id auxiliary
+   * column, so a node can own any number of chunk vectors.
+   */
+  upsertEmbeddings(nodeId: string, chunks: Array<{ index: number; text: string; embedding: Float32Array }>): void {
+    this.db.prepare('DELETE FROM node_chunks_vec WHERE node_id = ?').run(nodeId);
+    const insert = this.db.prepare(
+      'INSERT INTO node_chunks_vec(embedding, node_id, chunk_index, chunk_text) VALUES (?, ?, ?, ?)'
+    );
+    for (const chunk of chunks) {
+      // sqlite-vec aux INTEGER columns require BigInt binding, or better-sqlite3
+      // sends plain numbers as REAL and vec0 rejects the type mismatch.
+      insert.run(Buffer.from(chunk.embedding.buffer), nodeId, BigInt(chunk.index), chunk.text);
+    }
   }
 
+  /**
+   * KNN over chunk vectors, then collapsed to one result per node using its
+   * best (highest-scoring) chunk. candidateK over-fetches chunks so that
+   * enough distinct nodes surface before truncating to `limit`.
+   */
   searchVector(embedding: Float32Array, limit = 20): SearchResult[] {
-    return this.db.prepare(`
-      SELECT v.rowid, v.distance, n.id, n.title, n.content
-      FROM nodes_vec v
-      JOIN nodes n ON n.rowid = v.rowid
+    const candidateK = Math.max(limit * 10, 200);
+    const rows = this.db.prepare(`
+      SELECT node_id, chunk_text, distance
+      FROM node_chunks_vec
       WHERE embedding MATCH ? AND k = ?
       ORDER BY distance
-    `).all(Buffer.from(embedding.buffer), limit).map((r: any) => ({
-      nodeId: r.id,
-      title: r.title,
-      score: 1 - r.distance,
-      excerpt: firstParagraph(r.content ?? '', 200),
-    }));
+    `).all(Buffer.from(embedding.buffer), candidateK) as Array<{
+      node_id: string; chunk_text: string; distance: number;
+    }>;
+
+    const bestByNode = new Map<string, { distance: number; chunkText: string }>();
+    for (const row of rows) {
+      const existing = bestByNode.get(row.node_id);
+      if (!existing || row.distance < existing.distance) {
+        bestByNode.set(row.node_id, { distance: row.distance, chunkText: row.chunk_text });
+      }
+    }
+
+    const nodeIds = [...bestByNode.keys()];
+    if (nodeIds.length === 0) return [];
+
+    const titleRows = this.db.prepare(
+      `SELECT id, title FROM nodes WHERE id IN (${nodeIds.map(() => '?').join(',')})`
+    ).all(...nodeIds) as Array<{ id: string; title: string }>;
+    const titleById = new Map(titleRows.map(r => [r.id, r.title]));
+
+    return nodeIds
+      .map(nodeId => {
+        const best = bestByNode.get(nodeId)!;
+        return {
+          nodeId,
+          title: titleById.get(nodeId) ?? nodeId,
+          score: 1 - best.distance,
+          excerpt: best.chunkText,
+        };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
   }
 
   upsertSync(path: string, mtime: number): void {
@@ -278,11 +320,4 @@ export class Store {
   close(): void {
     this.db.close();
   }
-}
-
-function firstParagraph(content: string, maxLen: number): string {
-  const para = content.split(/\n\n+/).find(p => p.trim().length > 0 && !p.startsWith('#'));
-  if (!para) return '';
-  const trimmed = para.trim();
-  return trimmed.length > maxLen ? trimmed.slice(0, maxLen) + '...' : trimmed;
 }

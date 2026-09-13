@@ -22,9 +22,8 @@ describe('Search', () => {
 
     for (const node of nodes) {
       store.upsertNode(node);
-      const text = Embedder.buildEmbeddingText(node.title, [], node.content);
-      const embedding = await embedder.embed(text);
-      store.upsertEmbedding(node.id, embedding);
+      const chunks = await embedder.embedChunks(node.content);
+      store.upsertEmbeddings(node.id, chunks);
     }
   }, 60000);
 
